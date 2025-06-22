@@ -1,0 +1,37 @@
+#!/bin/bash
+DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
+echo $DIR
+mkdir Mapping
+$DIR/Tools/bwa mem -M -R '@RG\tID:sample_1\tLB:sample_1\tPL:ILLUMINA\tPM:HISEQ\tSM:sample_1' $DIR/Reference/M._tuberculosis_H37Rv.fasta ./*_R1.fastq.gz ./*_R2.fastq.gz > ./Mapping/aligned_reads.sam
+java -jar $DIR/Tools/picard.jar SortSam INPUT= ./Mapping/aligned_reads.sam OUTPUT= ./Mapping/sorted_reads.bam SORT_ORDER=coordinate
+java -jar $DIR/Tools/picard.jar CollectAlignmentSummaryMetrics R= $DIR/Reference/M._tuberculosis_H37Rv.fasta I= ./Mapping/sorted_reads.bam O= ./Mapping/alignment_metrics.txt
+java -jar $DIR/Tools/picard.jar CollectInsertSizeMetrics INPUT= ./Mapping/sorted_reads.bam OUTPUT= ./Mapping/insert_metrics.txt HISTOGRAM_FILE= ./Mapping/insert_size_histogram.pdf
+$DIR/Tools/samtools depth -a ./Mapping/sorted_reads.bam > ./Mapping/depth_out.txt
+java -jar $DIR/Tools/picard.jar MarkDuplicates INPUT= ./Mapping/sorted_reads.bam OUTPUT= ./Mapping/dedup_reads.bam METRICS_FILE= ./Mapping/metrics.txt
+java -jar $DIR/Tools/picard.jar BuildBamIndex INPUT= ./Mapping/dedup_reads.bam OUTPUT= ./Mapping/dedup_reads.bai
+java -jar $DIR/Tools/GenomeAnalysisTK.jar -T RealignerTargetCreator -R $DIR/Reference/M._tuberculosis_H37Rv.fasta -I ./Mapping/dedup_reads.bam -o ./Mapping/realignment_targets.list
+java -jar $DIR/Tools/GenomeAnalysisTK.jar -T IndelRealigner -R $DIR/Reference/M._tuberculosis_H37Rv.fasta -I ./Mapping/dedup_reads.bam -targetIntervals ./Mapping/realignment_targets.list -o ./Mapping/realigned_reads.bam
+mkdir VariantCalling1
+java -jar $DIR/Tools/GenomeAnalysisTK.jar -T HaplotypeCaller -R $DIR/Reference/M._tuberculosis_H37Rv.fasta -I ./Mapping/realigned_reads.bam -o ./VariantCalling1/raw_variants.vcf
+java -jar $DIR/Tools/GenomeAnalysisTK.jar -T SelectVariants -R $DIR/Reference/M._tuberculosis_H37Rv.fasta -V ./VariantCalling1/raw_variants.vcf -selectType SNP -o ./VariantCalling1/raw_snps.vcf
+java -jar $DIR/Tools/GenomeAnalysisTK.jar -T SelectVariants -R $DIR/Reference/M._tuberculosis_H37Rv.fasta -V ./VariantCalling1/raw_variants.vcf -selectType INDEL -o ./VariantCalling1/raw_indels.vcf
+java -jar $DIR/Tools/GenomeAnalysisTK.jar -T VariantFiltration -R $DIR/Reference/M._tuberculosis_H37Rv.fasta -V ./VariantCalling1/raw_snps.vcf --filterExpression 'QD < 2.0 || FS > 60.0 || MQ < 40.0 || MQRankSum < -12.5 || ReadPosRankSum < -8.0 || SOR > 4.0' --filterName "basic_snp_filter" -o ./VariantCalling1/filtered_snps.vcf
+java -jar $DIR/Tools/GenomeAnalysisTK.jar -T VariantFiltration -R $DIR/Reference/M._tuberculosis_H37Rv.fasta -V ./VariantCalling1/raw_indels.vcf --filterExpression 'QD < 2.0 || FS > 200.0 || ReadPosRankSum < -20.0 || SOR > 10.0' --filterName "basic_indel_filter" -o ./VariantCalling1/filtered_indels.vcf
+mkdir BQSR
+java -jar $DIR/Tools/GenomeAnalysisTK.jar -T BaseRecalibrator -R $DIR/Reference/M._tuberculosis_H37Rv.fasta -I ./Mapping/realigned_reads.bam -knownSites ./VariantCalling1/filtered_snps.vcf -knownSites ./VariantCalling1/filtered_indels.vcf -o ./BQSR/recal_data.table
+java -jar $DIR/Tools/GenomeAnalysisTK.jar -T BaseRecalibrator -R $DIR/Reference/M._tuberculosis_H37Rv.fasta -I ./Mapping/realigned_reads.bam -knownSites ./VariantCalling1/filtered_snps.vcf -knownSites ./VariantCalling1/filtered_indels.vcf -BQSR ./BQSR/recal_data.table -o ./BQSR/post_recal_data.table
+java -jar $DIR/Tools/GenomeAnalysisTK.jar -T PrintReads -R $DIR/Reference/M._tuberculosis_H37Rv.fasta -I ./Mapping/realigned_reads.bam -BQSR ./BQSR/recal_data.table -o ./BQSR/recal_reads.bam
+mkdir VariantCalling2
+java -jar $DIR/Tools/GenomeAnalysisTK.jar -T HaplotypeCaller -R $DIR/Reference/M._tuberculosis_H37Rv.fasta -I ./BQSR/recal_reads.bam -o ./VariantCalling2/raw_variants_recal.vcf
+bgzip -c ./VariantCalling2/raw_variants_recal.vcf > ./VariantCalling2/raw_variants_recal.vcf.gz
+mkdir Resistance
+cd VariantCalling2
+tabix -p vcf ./raw_variants_recal.vcf.gz
+$DIR/Tools/bcftools annotate -a $DIR/Reference/MTBREFRES.vcf.gz raw_variants_recal.vcf.gz -c INFO > ../Resistance/DRUG_RESISTANCE.vcf
+java -jar $DIR/Tools/GenomeAnalysisTK.jar -T VariantsToTable -R $DIR/Reference/M._tuberculosis_H37Rv.fasta -V ../Resistance/DRUG_RESISTANCE.vcf -F POS -F REF -F ALT -F QUAL -F QD -F DP -F GENE -F AMINO -F RES -o ../Resistance/DRUG_RESISTANCE.TABLE
+cd ../
+mkdir Denovo
+$DIR/Tools/velveth ./Denovo/ 31 -fastq -separate *_R1.fastq.gz *_R2.fastq.gz
+$DIR/Tools/velvetg ./Denovo/
+$DIR/Tools/blastn -db $DIR/Reference/hsp65ID -query ./Denovo/contigs.fa  -outfmt "6 sseqid qseqid pident slen qlen mismatch" -out ./Denovo/hsp65Identification.table
+exit
